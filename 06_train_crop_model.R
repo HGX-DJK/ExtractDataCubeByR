@@ -194,15 +194,22 @@ dir.create(res_dir, recursive = TRUE, showWarnings = FALSE)
 
 crop_map <- terra::predict(cube_raster, rf_model)
 
+# 自动从模型因子水平中检测"耕地"类名，兼容新旧两套标签命名：
+#   新标签（my_crop_samples.csv）: "Cropland"
+#   旧标签（规则伪标签）         : "Cropland_Crops"
+all_levels   <- levels(rf_model$predicted)
+crop_label   <- all_levels[grepl("^Cropland", all_levels)][1]
+message(">>> 检测到耕地类别名: '", crop_label, "'，共有类别: ", paste(all_levels, collapse = ", "))
+
 # 显式重映射为标准二值编码：
-# 1 = 耕地作物 (Cropland_Crops)
-# 0 = 非耕地 (Builtup_BareSoil / 裸土 / 建筑等)
+# 1 = 耕地 (crop_label)
+# 0 = 非耕地
 # 255 = 空值像元 (NoData)
-message(">>> 正在将模型分类结果规范化为标准二值编码 (1=耕地作物, 0=非耕地)...")
+message(">>> 正在将模型分类结果规范化为标准二值编码 (1=耕地, 0=非耕地)...")
 crop_map_binary <- terra::ifel(
   is.na(crop_map),
   255,
-  terra::ifel(crop_map == "Cropland_Crops", 1, 0)
+  terra::ifel(crop_map == crop_label, 1, 0)
 )
 
 crop_out_path <- file.path(res_dir, paste0(tools::file_path_sans_ext(basename(target_tif)), "_CropTypeMap.tif"))

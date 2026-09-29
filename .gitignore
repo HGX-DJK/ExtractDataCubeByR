@@ -30,3 +30,6 @@ extracted_data/
 .Ruserdata
 .Rproj.user/
 .DS_Store
+
+
+models/
