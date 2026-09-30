@@ -109,7 +109,12 @@ message("\n>>> [步骤 3/4] 正在执行农田与作物识别...")
 
 # 检查是否有地面作物调查样点 (Shapefile 或 CSV)
 samples_path_candidate <- c(
+  file.path(sdc_dir, "my_crop_samples.csv"),
+  "datacube_crop_classification/data/my_crop_samples.csv",
+  "data/my_crop_samples.csv",
+  "../data/my_crop_samples.csv",
   file.path(sdc_dir, "my_crop_samples.shp"),
+  "datacube_crop_classification/data/my_crop_samples.shp",
   "data/my_crop_samples.shp",
   "../data/my_crop_samples.shp"
 )
@@ -123,25 +128,53 @@ for (sp in samples_path_candidate) {
 
 if (!is.null(sample_file)) {
   message(">>> 检测到地面作物调查样点: ", sample_file)
-  samples_sf <- sf::st_read(sample_file, quiet = TRUE)
+  if (grepl("\\.csv$", sample_file, ignore.case = TRUE)) {
+    df_samp <- read.csv(sample_file)
+    if (nrow(df_samp) > 60000) {
+      set.seed(42)
+      df_samp <- df_samp[sample(nrow(df_samp), 60000), ]
+    }
+    samples_sf <- sf::st_as_sf(df_samp, coords = c("lon", "lat"), crs = 4326)
+  } else {
+    samples_sf <- sf::st_read(sample_file, quiet = TRUE)
+  }
   
   # 提取光谱值
   message(">>> 提取样点多光谱像元特征...")
   sample_vals <- terra::extract(cube_raster, samples_sf, df = TRUE)
   sample_vals$label <- as.factor(samples_sf$label)
+  sample_vals <- na.omit(sample_vals)
   
   # 训练随机森林模型
   message(">>> 训练多光谱随机森林作物分类器...")
-  rf_model <- randomForest(label ~ Blue + Green + Red + NIR + SWIR1 + SWIR2, data = sample_vals, ntree = 100)
+  use_ranger <- requireNamespace("ranger", quietly = TRUE)
+  if (use_ranger) {
+    rf_model <- ranger::ranger(
+      label ~ Blue + Green + Red + NIR + SWIR1 + SWIR2,
+      data = sample_vals,
+      num.trees = 100,
+      num.threads = 2
+    )
+    pred_fun <- function(m, d, ...) {
+      as.integer(ranger:::predict.ranger(m, data = as.data.frame(d))$predictions == "Cropland")
+    }
+    crop_map_raw <- terra::predict(cube_raster, rf_model, fun = pred_fun)
+  } else {
+    rf_model <- randomForest::randomForest(label ~ Blue + Green + Red + NIR + SWIR1 + SWIR2, data = sample_vals, ntree = 100)
+    crop_map_pred <- terra::predict(cube_raster, rf_model)
+    crop_map_raw <- terra::ifel(crop_map_pred == "Cropland", 1, 0)
+  }
   
-  # 全局栅格预测
-  message(">>> 对 SDC30 区域执行像元级作物类型预测制图...")
-  crop_map <- terra::predict(cube_raster, rf_model)
+  # 空间平滑
+  message(">>> 执行 3x3 空间众数滤波平滑...")
+  crop_map_smooth <- terra::focal(crop_map_raw, w = 3, fun = "modal", na.policy = "omit")
+  crop_map_final <- terra::ifel(is.na(crop_map_smooth), 255, crop_map_smooth)
+  
   crop_out_path <- file.path(output_dir, paste0(tools::file_path_sans_ext(basename(target_tif)), "_CropTypeMap.tif"))
-  terra::writeRaster(crop_map, crop_out_path, overwrite = TRUE)
-  message(">>> 作物分类图已生成: ", crop_out_path)
+  terra::writeRaster(crop_map_final, crop_out_path, datatype = "INT1U", NAflag = 255, overwrite = TRUE)
+  message(">>> 作物分类图已生成并保存至: ", crop_out_path)
 } else {
-  message(">>> 当前未提供地面样点文件 (如 data/my_crop_samples.shp)。")
+  message(">>> 当前未提供地面样点文件 (如 data/my_crop_samples.csv 或 .shp)。")
   message(">>> 正在采用作物物候动态阈值法，提取旺盛生长的农田植被覆盖区 (NDVI > 0.4)...")
   
   # 农田植被掩膜提取: 0 = 非农田/低植被, 1 = 农田高覆盖植被

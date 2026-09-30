@@ -45,22 +45,34 @@ if (file.exists(sample_points_path)) {
 
 # 假设已有规整化立方体（或加载本地已存对象）
 cube_file <- "data/ct_chile/sent_19HBA_reg.rds"
+extracted_pts <- NULL
+
 if (file.exists(cube_file)) {
   cube_s2 <- readRDS(cube_file)
-  message(">>> 成功加载 Sentinel-2 多时相数据立方体: ", cube_file)
+  message(">>> 成功加载 Sentinel-2 多时相数据立方体元数据: ", cube_file)
   
-  # 调用 sits_get_data 从数据立方体中提取时序数据
-  message(">>> 正在提取多时相波段时序...")
-  extracted_pts <- sits_get_data(
-    cube       = cube_s2,
-    samples    = points_sf,
-    label_attr = "label",
-    multicores = 2
-  )
+  # 验证底层 TIFF 文件是否存在
+  first_tif <- tryCatch(cube_s2$file_info[[1]]$path[1], error = function(e) "")
+  if (nzchar(first_tif) && file.exists(first_tif)) {
+    message(">>> 底层栅格切片校验通过，正在提取多时相波段时序...")
+    extracted_pts <- sits_get_data(
+      cube       = cube_s2,
+      samples    = points_sf,
+      label_attr = "label",
+      multicores = 2
+    )
+  } else {
+    message(">>> [提示] 本地未包含数 GB 的底层原始 Sentinel-2 栅格切片。")
+    message(">>> 正在直接加载离线已提取的标准多时相时序对象 (balanced_samples.rds) 继续流程...")
+    if (file.exists("data/ct_chile/balanced_samples.rds")) {
+      extracted_pts <- readRDS("data/ct_chile/balanced_samples.rds")
+    }
+  }
   
-  # 查看提取结果的结构
-  message(">>> 提取完成！数据格式为 sits tibble，前 2 行如下:")
-  print(head(extracted_pts, 2))
+  if (!is.null(extracted_pts)) {
+    message(">>> 样本提取/加载就绪！数据格式为 sits tibble，前 2 行如下:")
+    print(head(extracted_pts, 2))
+  }
 }
 
 message("\n=================================================================")
@@ -80,14 +92,21 @@ if (file.exists(cube_file) && file.exists(dem_cube_file)) {
   
   # 从多源数据立方体一次性提取所有光谱波段 + 高程信息
   message(">>> 从多源立方体中提取联合时序特征...")
-  extracted_multi <- sits_get_data(
-    cube       = cube_multi,
-    samples    = points_sf[1:min(50, nrow(points_sf)), ], # 提取前50个点作为演示
-    label_attr = "label",
-    multicores = 2
-  )
-  message(">>> 联合时序提取成功！单个样本包含的波段:")
-  print(colnames(extracted_multi$time_series[[1]]))
+  extracted_multi <- tryCatch({
+    sits_get_data(
+      cube       = cube_multi,
+      samples    = points_sf[1:min(50, nrow(points_sf)), ],
+      label_attr = "label",
+      multicores = 2
+    )
+  }, error = function(e) {
+    message(">>> [提示] 底层 DEM/S2 栅格切片未下载，跳过实时重提取。")
+    NULL
+  })
+  if (!is.null(extracted_multi)) {
+    message(">>> 联合时序提取成功！单个样本包含的波段:")
+    print(colnames(extracted_multi$time_series[[1]]))
+  }
 }
 
 message("\n=================================================================")
@@ -100,14 +119,21 @@ if (file.exists(roi_file) && file.exists(cube_file)) {
   poly_sf$label <- "Study_Area"
   
   message(">>> 从多边形地块内采样提取像元 (例如每地块抽取 20 个像素时序)...")
-  extracted_poly <- sits_get_data(
-    cube       = cube_s2,
-    samples    = poly_sf,
-    n_sam_pol  = 20,         # 每个地块抽样 20 个点
-    label_attr = "label",
-    multicores = 2
-  )
-  message(">>> 地块内部像元提取成功，总计获得 ", nrow(extracted_poly), " 条像元时间序列。")
+  extracted_poly <- tryCatch({
+    sits_get_data(
+      cube       = cube_s2,
+      samples    = poly_sf,
+      n_sam_pol  = 20,
+      label_attr = "label",
+      multicores = 2
+    )
+  }, error = function(e) {
+    message(">>> [提示] 底层栅格切片未下载，跳过地块像元重提取。")
+    NULL
+  })
+  if (!is.null(extracted_poly)) {
+    message(">>> 地块内部像元提取成功，总计获得 ", nrow(extracted_poly), " 条像元时间序列。")
+  }
 }
 
 message("\n=================================================================")
@@ -127,17 +153,22 @@ message("\n=================================================================")
 message(">>> 场景 5: 导出提取结果为标准文件 (供 Python / 机器学习使用)")
 message("=================================================================")
 
-# 将提取到的样本保存为本地 RDS
-saveRDS(extracted_pts, file.path(output_dir, "extracted_samples.rds"))
-
-# 扁平化展开为常见的多时相表格 CSV (每一行一个点在某日期的波段值，或按列展开)
-flat_ts <- extracted_pts |>
-  tidyr::unnest(time_series)
-
-csv_path <- file.path(output_dir, "extracted_timeseries_flat.csv")
-readr::write_csv(flat_ts, csv_path)
-
-message(">>> 提取结果已导出: ")
-message("   1. 完整 R 对象: ", file.path(output_dir, "extracted_samples.rds"))
-message("   2. 扁平化 CSV 表格: ", csv_path)
+# 导出提取结果为标准文件 (供 Python / 机器学习使用)
+if (!is.null(extracted_pts)) {
+  # 将提取到的样本保存为本地 RDS
+  saveRDS(extracted_pts, file.path(output_dir, "extracted_samples.rds"))
+  
+  # 扁平化展开为常见的多时相表格 CSV (每一行一个点在某日期的波段值，或按列展开)
+  flat_ts <- extracted_pts |>
+    tidyr::unnest(time_series)
+  
+  csv_path <- file.path(output_dir, "extracted_timeseries_flat.csv")
+  readr::write_csv(flat_ts, csv_path)
+  
+  message(">>> 提取结果已导出: ")
+  message("   1. 完整 R 对象: ", file.path(output_dir, "extracted_samples.rds"))
+  message("   2. 扁平化 CSV 表格: ", csv_path)
+} else {
+  message(">>> [提示] 未生成 extracted_pts 对象，跳过导出。")
+}
 message(">>> 多数据立方体时序提取演示完成！")

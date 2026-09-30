@@ -126,11 +126,21 @@ if (file.exists(class_file)) {
   )
 }
 
-# 10. 输出分类信息与摘要
+# 10. 输出分类信息与摘要，保存分析成果
 if (exists("class_19HBA")) {
   message(">>> 作物分类识别成功完成！")
-  message(">>> 包含的作物与土地覆盖类别: ")
-  print(sits_labels(class_19HBA))
+  labels_vec <- sits_labels(class_19HBA)
+  message(">>> 包含的作物与土地覆盖类别 (共 ", length(labels_vec), " 类): ")
+  print(labels_vec)
+  
+  # 导出类别台账与配色表到 output 目录
+  cl_export <- cl_tbl_eng |>
+    dplyr::filter(name %in% labels_vec)
+  write.csv(cl_export, file.path(output_dir, "crop_classes_summary.csv"), row.names = FALSE)
+  saveRDS(rfor_model, file.path(output_dir, "crop_rfor_model.rds"))
+  message(">>> 成果已保存至: ", normalizePath(output_dir))
+  message("    - 类别色系表: ", file.path(output_dir, "crop_classes_summary.csv"))
+  message("    - 随机森林模型: ", file.path(output_dir, "crop_rfor_model.rds"))
 }
 
 message(">>> 脚本运行结束。")

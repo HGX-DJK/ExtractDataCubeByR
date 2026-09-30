@@ -22,9 +22,13 @@ options(repos = c(CRAN = "https://mirrors.tuna.tsinghua.edu.cn/CRAN/"))
 required_packages <- c(
   "tibble",
   "dplyr",
+  "tidyr",
+  "readr",
   "sf",
   "terra",
+  "ranger",
   "randomForest",
+  "e1071",
   "gdalcubes",
   "rstac",
   "stars",
