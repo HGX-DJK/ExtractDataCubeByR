@@ -90,6 +90,9 @@ if (nlyr(cube_raster) >= 6) {
   names(cube_raster)[1:6] <- c("Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2")
 }
 
+feature_cols <- c("Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2",
+                  "NDVI", "EVI", "MNDWI", "LSWI", "NDBI", "NDTI")
+
 # 4. 获取样点数据并提取特征
 if (!is.null(user_sample_file)) {
   message(">>> 成功加载地面真实训练样点: ", user_sample_file)
@@ -106,44 +109,54 @@ if (!is.null(user_sample_file)) {
     } else {
       df_samples <- df_raw
     }
-    samples_vect <- terra::vect(df_samples, geom = c("lon", "lat"), crs = "EPSG:4326")
+
+    # 检查 CSV 是否已自带直出的 12 维特征
+    has_features <- all(feature_cols %in% names(df_samples))
+    if (has_features) {
+      message(">>> [极速直出通道] 检测到样本文件已包含完整 12 维遥感多光谱波段与植被指数！")
+      message(">>> 跳过耗时的空间栅格提取，直通极速训练...")
+      sample_features <- df_samples
+      sample_features$label <- as.factor(sample_features$label)
+      sample_features <- na.omit(sample_features)
+    } else {
+      samples_vect <- terra::vect(df_samples, geom = c("lon", "lat"), crs = "EPSG:4326")
+    }
   } else {
     samples_sf <- sf::st_read(user_sample_file, quiet = TRUE)
     samples_vect <- terra::vect(samples_sf)
   }
 } else {
-  stop("未检测到真实样点文件，请先运行 extract_samples_from_groundtruth.py 提取样点！")
+  stop("未检测到真实样点文件，请先运行 prepare_samples.py 提取样点！")
 }
 
-# 5. 提取多光谱像元特征与特征工程计算
-message(">>> 正在从数据立方体提取像元多光谱特征...")
-sample_features <- terra::extract(cube_raster, samples_vect, df = TRUE)
-sample_features$label <- as.factor(samples_vect$label)
-sample_features <- na.omit(sample_features)
+# 5. 若未自带特征，则从数据立方体提取像元多光谱特征并计算物候指数
+if (!exists("sample_features")) {
+  message(">>> 正在从数据立方体提取像元多光谱特征...")
+  sample_features <- terra::extract(cube_raster, samples_vect, df = TRUE)
+  sample_features$label <- as.factor(samples_vect$label)
+  sample_features <- na.omit(sample_features)
 
-message(">>> 正在构建遥感作物识别核心光谱与物候指数 (NDVI, EVI, MNDWI, LSWI, NDBI, NDTI)...")
-sample_features <- sample_features %>%
-  mutate(
-    b = Blue / 10000,
-    g = Green / 10000,
-    r = Red / 10000,
-    nir = NIR / 10000,
-    s1 = SWIR1 / 10000,
-    s2 = SWIR2 / 10000,
-    # 植被生长与生物量指数
-    NDVI  = (nir - r) / (nir + r + 1e-6),
-    EVI   = 2.5 * (nir - r) / (nir + 6 * r - 7.5 * b + 1.0 + 1e-6),
-    # 水分与水体指数 (区分沟渠、水田与洼地)
-    MNDWI = (g - s1) / (g + s1 + 1e-6),
-    LSWI  = (nir - s1) / (nir + s1 + 1e-6),
-    # 不透水面与建筑指数 (区分城镇、道路与村庄)
-    NDBI  = (s1 - nir) / (s1 + nir + 1e-6),
-    # 耕作/麦茬/秸秆残留指数 (区分收割麦田与常年裸地)
-    NDTI  = (s1 - s2) / (s1 + s2 + 1e-6)
-  )
-
-feature_cols <- c("Blue", "Green", "Red", "NIR", "SWIR1", "SWIR2",
-                  "NDVI", "EVI", "MNDWI", "LSWI", "NDBI", "NDTI")
+  message(">>> 正在构建遥感作物识别核心光谱与物候指数 (NDVI, EVI, MNDWI, LSWI, NDBI, NDTI)...")
+  sample_features <- sample_features %>%
+    mutate(
+      b = Blue / 10000,
+      g = Green / 10000,
+      r = Red / 10000,
+      nir = NIR / 10000,
+      s1 = SWIR1 / 10000,
+      s2 = SWIR2 / 10000,
+      # 植被生长与生物量指数
+      NDVI  = (nir - r) / (nir + r + 1e-6),
+      EVI   = 2.5 * (nir - r) / (nir + 6 * r - 7.5 * b + 1.0 + 1e-6),
+      # 水分与水体指数 (区分沟渠、水田与洼地)
+      MNDWI = (g - s1) / (g + s1 + 1e-6),
+      LSWI  = (nir - s1) / (nir + s1 + 1e-6),
+      # 不透水面与建筑指数 (区分城镇、道路与村庄)
+      NDBI  = (s1 - nir) / (s1 + nir + 1e-6),
+      # 耕作/麦茬/秸秆残留指数 (区分收割麦田与常年裸地)
+      NDTI  = (s1 - s2) / (s1 + s2 + 1e-6)
+    )
+}
 
 message(">>> 样本各类别数量分布:")
 print(table(sample_features$label))

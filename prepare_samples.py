@@ -191,7 +191,7 @@ def crop_ground_truth_tile(sdc_path, ref_path, out_gt_path):
 # ==============================================================================
 # 从局部切片真值底图中提取空间样点 (带侵蚀纯化)
 # ==============================================================================
-def extract_local_tile_samples(gt_path, out_csv_path, step_size=10, erode_edges=True):
+def extract_local_tile_samples(gt_path, out_csv_path, step_size=10, erode_edges=True, sdc_path=None, extract_features=True):
     if not os.path.exists(gt_path):
         print(f"[错误] 未找到切片真值底图: {gt_path}")
         return False
@@ -202,6 +202,8 @@ def extract_local_tile_samples(gt_path, out_csv_path, step_size=10, erode_edges=
     print(f"    • 输出样点文件 : {os.path.basename(out_csv_path)}")
     print(f"    • 格网采样步长 : 每 {step_size} 个像元取 1 点 (物理间距约 {step_size * 30} 米)")
     print(f"    • 边缘侵蚀纯化 : {'已启用 (剥离地块边界 30米 混合过渡像元)' if erode_edges else '未启用'}")
+    if extract_features and sdc_path and os.path.exists(sdc_path):
+        print(f"    • 特征直出加速 : 已启用 (秒级直出 6 波段 + 6 大核心遥感指数)")
     print("=================================================================")
 
     with rasterio.open(gt_path) as src:
@@ -236,6 +238,69 @@ def extract_local_tile_samples(gt_path, out_csv_path, step_size=10, erode_edges=
     cc_v = cc[valid]
     labels = np.where(is_crop[valid], "Cropland", "Non_Cropland")
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # 特征直出与物理质量过滤 (毫秒级 NumPy 矢量化采样)
+    # ──────────────────────────────────────────────────────────────────────────
+    feature_dict = {}
+    if extract_features and sdc_path and os.path.exists(sdc_path):
+        print(">>> 正在以 NumPy 毫秒级矩阵切片直出多光谱波段与遥感指数 (NDVI, EVI, MNDWI, LSWI, NDBI, NDTI)...")
+        with rasterio.open(sdc_path) as sdc:
+            bands_data = sdc.read()  # (6, H, W)
+            
+        b2 = bands_data[0, rr_v, cc_v]
+        b3 = bands_data[1, rr_v, cc_v]
+        b4 = bands_data[2, rr_v, cc_v]
+        b8 = bands_data[3, rr_v, cc_v]
+        b11 = bands_data[4, rr_v, cc_v]
+        b12 = bands_data[5, rr_v, cc_v]
+
+        # 遥感物理合理性清洗：剔除无数据黑边像元 (全0) 与极端异常饱和值
+        valid_spec = (b2 > 0) & (b4 > 0) & (b8 > 0) & (b2 < 9000)
+        n_filtered = int(np.sum(~valid_spec))
+        if n_filtered > 0:
+            print(f">>> 光谱物理清洗: 剔除了 {n_filtered:,} 个黑边无数据或异常饱和像元。")
+
+        rr_v = rr_v[valid_spec]
+        cc_v = cc_v[valid_spec]
+        labels = labels[valid_spec]
+        b2 = b2[valid_spec]
+        b3 = b3[valid_spec]
+        b4 = b4[valid_spec]
+        b8 = b8[valid_spec]
+        b11 = b11[valid_spec]
+        b12 = b12[valid_spec]
+
+        # 归一化地表反射率 (0 ~ 1)
+        b = b2.astype(np.float32) / 10000.0
+        g = b3.astype(np.float32) / 10000.0
+        r = b4.astype(np.float32) / 10000.0
+        nir = b8.astype(np.float32) / 10000.0
+        s1 = b11.astype(np.float32) / 10000.0
+        s2 = b12.astype(np.float32) / 10000.0
+
+        eps = 1e-6
+        ndvi = (nir - r) / (nir + r + eps)
+        evi = 2.5 * (nir - r) / (nir + 6.0 * r - 7.5 * b + 1.0 + eps)
+        mndwi = (g - s1) / (g + s1 + eps)
+        lswi = (nir - s1) / (nir + s1 + eps)
+        ndbi = (s1 - nir) / (s1 + nir + eps)
+        ndti = (s1 - s2) / (s1 + s2 + eps)
+
+        feature_dict = {
+            'Blue': b2,
+            'Green': b3,
+            'Red': b4,
+            'NIR': b8,
+            'SWIR1': b11,
+            'SWIR2': b12,
+            'NDVI': np.round(ndvi, 6),
+            'EVI': np.round(evi, 6),
+            'MNDWI': np.round(mndwi, 6),
+            'LSWI': np.round(lswi, 6),
+            'NDBI': np.round(ndbi, 6),
+            'NDTI': np.round(ndti, 6),
+        }
+
     xs = tfm.c + (cc_v + 0.5) * tfm.a
     ys = tfm.f + (rr_v + 0.5) * tfm.e
 
@@ -247,9 +312,14 @@ def extract_local_tile_samples(gt_path, out_csv_path, step_size=10, erode_edges=
     except Exception:
         lons, lats = fallback_utm_to_wgs84(xs, ys, zone_number=50, northern=True)
 
-    df = pd.DataFrame({'lon': np.round(lons, 7), 'lat': np.round(lats, 7), 'label': labels})
+    df_data = {'lon': np.round(lons, 7), 'lat': np.round(lats, 7), 'label': labels}
+    df_data.update(feature_dict)
+    df = pd.DataFrame(df_data)
+
     n_crop = int(np.sum(labels == "Cropland"))
     n_noncrop = int(np.sum(labels == "Non_Cropland"))
+    crop_pct = n_crop / len(df) * 100 if len(df) > 0 else 0
+    non_pct = n_noncrop / len(df) * 100 if len(df) > 0 else 0
 
     os.makedirs(os.path.dirname(out_csv_path), exist_ok=True)
     df.to_csv(out_csv_path, index=False)
@@ -257,8 +327,10 @@ def extract_local_tile_samples(gt_path, out_csv_path, step_size=10, erode_edges=
     print("=================================================================")
     print(">>> 局部切片样点提取完毕！")
     print(f"    • 成果文件 : {out_csv_path} ({os.path.getsize(out_csv_path) / 1024 / 1024:.2f} MB)")
-    print(f"    • 样点总数 : {len(df):,} 个 (耕地: {n_crop:,} [58.7%], 非耕地: {n_noncrop:,} [41.3%])")
+    print(f"    • 样点总数 : {len(df):,} 个 (耕地: {n_crop:,} [{crop_pct:.1f}%], 非耕地: {n_noncrop:,} [{non_pct:.1f}%])")
     print(f"    • 经纬范围 : [{lons.min():.4f}°E ~ {lons.max():.4f}°E], [{lats.min():.4f}°N ~ {lats.max():.4f}°N]")
+    if feature_dict:
+        print(f"    • 特征维度 : 包含 12 维完整遥感光谱与植被指数特征 (可直接供 R/Python 训练秒读)！")
     print("=================================================================")
     return True
 
@@ -389,6 +461,7 @@ def main():
     parser.add_argument("--step", type=int, default=10, help="局部切片抽样步长 (默认: 10，物理间距300米)")
     parser.add_argument("--samples", type=int, default=100000, help="全图不裁剪模式下的目标样本规模 (默认: 100000)")
     parser.add_argument("--no-erode", action="store_true", help="禁用边缘侵蚀 (保留边缘混合像元)")
+    parser.add_argument("--no-features", action="store_true", help="仅提取经纬度坐标与标签，不直出 12 维遥感多光谱波段与指数")
     parser.add_argument("--crop-only", action="store_true", help="仅执行大图裁剪出切片底图，不提取样点")
     parser.add_argument("--sdc", default=default_sdc, help="SDC30 目标切片路径")
     parser.add_argument("--ref", default=None, help="来源大尺度参考真值图层路径 (如 gengdi.tif)")
@@ -422,12 +495,14 @@ def main():
     else:
         print(f">>> [快速通道] 检测到本地已存在现成切片底图 ({os.path.basename(args.gt)})，直接秒级提取局部切片样点。")
 
-    # 提取局部切片样点
+    # 提取局部切片样点 (默认直出 12 维特征工程波段与指数)
     extract_local_tile_samples(
         gt_path=args.gt,
         out_csv_path=args.out_csv,
         step_size=args.step,
-        erode_edges=not args.no_erode
+        erode_edges=not args.no_erode,
+        sdc_path=args.sdc,
+        extract_features=not args.no_features
     )
 
 
